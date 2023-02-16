@@ -1,20 +1,31 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.StrUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.SystemConstants;
+import org.springframework.data.geo.*;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import reactor.util.Metrics;
 
 import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
-import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
+import static com.hmdp.utils.RedisConstants.*;
 
 /**
  * <p>
@@ -223,5 +234,54 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 //        2.删除缓存
         stringRedisTemplate.delete(CACHE_SHOP_KEY + id) ;
         return Result.ok();
+    }
+
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+//        判断是否需要根据坐标查询
+        if(x == null || y == null) {
+            // 根据类型分页查询
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            // 返回数据
+            return Result.ok(page.getRecords());
+        }
+//        计算分页参数
+        int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+        String key = SHOP_GEO_KEY + typeId;
+//        查询redis，按照距离排序，分页，结果：shopId，距离
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo()
+                .search(
+                        key,
+                        GeoReference.fromCoordinate(x, y),
+                        new Distance(5000, RedisGeoCommands.DistanceUnit.METERS),
+                        RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
+                );
+        if( results == null ) {
+            return Result.ok();
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> content = results.getContent();
+        List<Long> ids = new ArrayList<>(content.size());
+        Map<String,Distance> distanceMap = new HashMap<>(content.size());
+//        截取from到end的部分
+        content.stream().skip(from).forEach(result -> {
+//          解析出id
+            String shopIdStr = result.getContent().getName();
+            Distance distance = result.getDistance();
+            ids.add(Long.valueOf(shopIdStr));
+            distanceMap.put(shopIdStr,distance);
+        });
+        if( ids.isEmpty() ){
+            return Result.ok();
+        }
+//        根据id查询店铺
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        shops.forEach(shop -> {
+            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+        });
+        return Result.ok(shops);
     }
 }
